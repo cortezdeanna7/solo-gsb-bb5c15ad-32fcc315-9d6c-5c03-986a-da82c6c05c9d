@@ -1,4 +1,4 @@
-"""FastAPI 应用：时间序列异常检测接口。"""
+"""FastAPI 应用：时间序列异常检测 + 趋势扫描接口。"""
 
 from __future__ import annotations
 
@@ -14,8 +14,11 @@ from .models import (
     DetectResponse,
     DetectionListResponse,
     HealthResponse,
+    TrendRequest,
+    TrendResponse,
     parse_timestamp,
 )
+from .trends import scan_trends
 
 
 @asynccontextmanager
@@ -28,9 +31,10 @@ app = FastAPI(
     title="时间序列异常检测 API",
     description=(
         "接收带时间戳的数值序列，基于稳健滑动窗口（中位数 + MAD）识别突变，"
-        "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite。"
+        "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite；"
+        "另提供滑窗 Mann-Kendall + Theil-Sen 趋势扫描（无状态）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -130,3 +134,21 @@ def list_detections(
 @app.get("/health", response_model=HealthResponse, tags=["系统"])
 def health() -> dict:
     return {"status": "ok", "database": database.DB_PATH}
+
+
+@app.post("/api/v1/trends", response_model=TrendResponse, tags=["趋势"])
+def create_trend_scan(req: TrendRequest) -> dict:
+    """对序列做滑窗 Mann-Kendall + Theil-Sen 趋势扫描（无状态，不入库）。
+
+    仅当窗口 ``p_value ≤ alpha`` 且 ``|slope| ≥ min_slope`` 时标记上升/下降；
+    方向相同、时间范围重叠或首尾相接的显著窗口合并为趋势区间返回。
+    """
+    timestamps, values = _prepare_series(req.points)
+    return scan_trends(
+        timestamps=timestamps,
+        values=values,
+        window_size=req.window_size,
+        step_size=req.step_size,
+        alpha=req.alpha,
+        min_slope=req.min_slope,
+    )

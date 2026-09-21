@@ -1,8 +1,8 @@
 # 时间序列异常检测 API
 
-基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测服务。
+基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测与趋势扫描服务。
 
-接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。
+接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。另提供**趋势扫描**接口：滑窗 Mann-Kendall 检验（含重复值方差修正与连续性校正）+ 按实际时间差计算的 Theil-Sen 斜率，输出合并后的上升/下降趋势区间（无状态，不入库）。
 
 ## 特性
 
@@ -13,6 +13,7 @@
   - `guarded`：只有判为正常的点才允许进入后续基线，孤立尖刺不会污染其后的中位数与离散度；当连续异常达到 `rebase_after` 个点（默认等于 `min_window`，且不得更小）时，用该异常段最近 `min_window` 个点重建基线并递增基线代次（generation）。触发重建的点仍保持异常，原异常区间也不会被拆分。
 - **区间合并**：相邻触发点间隔不超过 `merge_gap + 1` 个点时合并为一个异常区间（能把一次持续数点的水平偏移归为一段；guarded 重建不参与区间拆分）。
 - **采样断档感知 `gap_reset_factor`**（可选，默认关闭）：以排序后相邻点**正时间差的中位数**估算常规采样间隔，相邻间隔超过 `gap_reset_factor` 倍即判定为断档并切分采样分段。每个分段独立执行 `min_window` 预热，rolling/guarded 的基线、guarded 的连续异常计数与重建代次都在分段起点从头开始，异常区间**绝不跨越断档合并**。响应返回断档边界、估算间隔与逐点 / 逐区间的分段编号；断档后即使水位整体迁移，也不会拿断档前的旧基线误报。
+- **趋势扫描 `POST /api/v1/trends`**：以 `window_size` / `step_size` 滑窗，每窗执行 Mann-Kendall 单调趋势检验（方差含**重复值 tie 修正**、z 分数含**连续性校正**，双侧 p 值取正态近似），并以**实际时间差**计算 Theil-Sen 斜率（值/秒，非等距采样下依然成立）。仅当 `p_value ≤ alpha` 且 `|slope| ≥ min_slope` 时标记上升/下降；方向相同、时间范围重叠或首尾相接的显著窗口合并为趋势区间，返回区间范围、成员窗口、最小 p 值与成员斜率中位数。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
 - **接口文档**：启动后访问 Swagger UI `/docs`、ReDoc `/redoc`。
@@ -25,12 +26,14 @@
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与入参校验
 │   ├── detection.py   # 滑动窗口稳健异常检测核心算法
+│   ├── trends.py      # 滑窗 Mann-Kendall + Theil-Sen 趋势扫描
 │   ├── models.py      # Pydantic 请求/响应模型、时间戳解析
 │   └── database.py    # SQLite 存储层
 ├── examples/
 │   ├── request.json          # rolling 示例请求（含一次上升突变与一次下降突变）
 │   ├── request_guarded.json  # guarded 示例请求（孤立尖刺 + 水平偏移重建基线）
-│   └── request_gap.json      # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
+│   ├── request_gap.json      # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
+│   └── request_trends.json   # 趋势扫描示例请求（先升后降，含一对重复值）
 ├── scripts/
 │   └── smoke_test.py  # 算法 + API 端到端冒烟测试
 ├── data/              # SQLite 数据库目录（compose 挂载命名卷）
@@ -101,6 +104,24 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 ### `GET /health` — 健康检查
 
+### `POST /api/v1/trends` — 趋势扫描（无状态，不入库）
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `points` | `[{timestamp, value}]` | 必填（≥3） | 时间戳格式与检测接口一致；无需预先排序，服务端自动排序并拒绝重复时间戳 |
+| `window_size` | int | 10 | 滑窗大小，点数（3~10000），Mann-Kendall 检验在该窗口内进行 |
+| `step_size` | int | 1 | 滑窗步长，点数（1~10000）；不足一个窗口的尾部丢弃 |
+| `alpha` | float | 0.05 | Mann-Kendall 显著性水平（双侧，必须 0 < alpha < 1） |
+| `min_slope` | float | 0.0 | 趋势显著所需的最小绝对斜率（≥0，单位：值/秒，与 `slope` 同单位） |
+
+约束：点数必须 ≥ `window_size`；重复时间戳返回 422。
+
+每个窗口返回 `s`（Mann-Kendall S 统计量）、`var_s`（重复值修正方差）、`z_score`（连续性校正）、`p_value`、`slope`（Theil-Sen，值/秒）、`significant` 与 `direction`（`上升` / `下降` / `无显著趋势`）。显著性判定：`p_value ≤ alpha` 且 `|slope| ≥ min_slope`，方向取斜率符号（斜率恰为 0 时取 S 的符号）。
+
+合并规则：方向相同且时间范围**重叠或首尾相接**（后一窗口起点索引 ≤ 当前区间终点索引 + 1）的显著窗口合并为一个趋势区间；`step_size ≤ window_size` 时窗口天然重叠或相接，`step_size > window_size` 时窗口间存在未覆盖空档、不会合并。每个区间返回 `direction`、`start/end_index` 与 `start/end_time`、`window_indices`（成员窗口）、`min_p_value`（成员最小 p 值）与 `median_slope`（成员斜率中位数）。
+
 ## 调用示例
 
 ### rolling 模式（默认）
@@ -144,6 +165,57 @@ curl -s -X POST http://localhost:8000/api/v1/detections \
 - 摘要 `gap_reset_factor`（回显倍数）、`estimated_interval_seconds`（估算常规间隔，秒）、`sampling_segment_count`（采样分段数）；
 - `gap_boundaries[]`：每个断档边界包含 `before_index/after_index`、`before_time/after_time`、`gap_seconds`（断档实际时长）、`interval_seconds`（常规间隔）与 `gap_ratio`（倍数）；
 - 逐点注解与异常区间上的 `sampling_segment_index`（所属采样分段编号，从 0 开始）。
+
+### 趋势扫描（Mann-Kendall + Theil-Sen）
+
+```bash
+# 48 个点、5 分钟间隔：前 24 个点约 +0.15/步 上升，后 24 个点镜像回落，
+# 其中一对相邻点取相同值（演示重复值 tie 修正）。
+curl -s -X POST http://localhost:8000/api/v1/trends \
+  -H "Content-Type: application/json" \
+  -d @examples/request_trends.json | python -m json.tool
+```
+
+响应中关注：
+
+- `windows[]`：每个滑窗的 `s` / `var_s` / `z_score` / `p_value` / `slope`（值/秒）与 `direction`；
+- `segments[]`：合并后的趋势区间——本例返回一段 `上升`（窗口 0~3，索引 0~23）与一段 `下降`（窗口 5~9，索引 20~47），跨越峰值的窗口 4 因 S 被抵消而不显著、不参与合并；
+- 区间上的 `min_p_value` 与 `median_slope`（本例约 ±0.0005 值/秒 = ±0.15/300s）。
+
+```json
+{
+  "point_count": 48,
+  "window_size": 12,
+  "step_size": 4,
+  "alpha": 0.05,
+  "min_slope": 0.0,
+  "window_count": 10,
+  "significant_window_count": 9,
+  "trend_segment_count": 2,
+  "segments": [
+    {
+      "direction": "上升",
+      "start_index": 0,
+      "end_index": 23,
+      "start_time": "2026-09-20T08:00:00+00:00",
+      "end_time": "2026-09-20T09:55:00+00:00",
+      "window_indices": [0, 1, 2, 3],
+      "window_count": 4,
+      "min_p_value": 8.3e-06,
+      "median_slope": 0.0005
+    },
+    {
+      "direction": "下降",
+      "start_index": 20,
+      "end_index": 47,
+      "window_indices": [5, 6, 7, 8, 9],
+      "window_count": 5,
+      "min_p_value": 8.3e-06,
+      "median_slope": -0.0005
+    }
+  ]
+}
+```
 
 ### 内联 JSON 示例
 
@@ -289,6 +361,14 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
 
 与基于均值/标准差的方案相比，中位数 + MAD 对窗口内少量离群点不敏感，能在尖刺和水平偏移共存时给出稳定基线；guarded 策略进一步保证异常点（除触发重建的长异常段末尾 `min_window` 个点外）不参与基线，适合存在真实水位迁移、又不希望偶发尖刺抬高离散度的场景。
 
+### 趋势扫描算法（`/api/v1/trends`）
+
+1. 以 `window_size` / `step_size`（均为点数）在排序后的序列上滑动完整窗口，不足一个窗口的尾部丢弃。
+2. 每个窗口执行 Mann-Kendall 检验：S 为所有后-前点对符号差之和；方差带**重复值修正** `var(S) = [n(n−1)(2n+5) − Σ t(t−1)(2t+5)] / 18`（t 为各等值组大小）；z 分数带**连续性校正**（S>0 减 1、S<0 加 1）；双侧 p 值取标准正态近似 `2·(1−Φ(|z|))`。窗口内值全部相同时 var(S)=0，直接返回 p=1（无趋势）。
+3. 同一窗口用**实际时间差**（秒）计算 Theil-Sen 斜率：所有点对 `(v_j−v_i)/(t_j−t_i)` 的中位数，单位「值/秒」；秩检验本身与采样间隔无关，斜率则在非等距采样下依然无偏。
+4. 仅当 `p_value ≤ alpha` 且 `|slope| ≥ min_slope` 时标记上升/下降（方向取斜率符号，斜率恰为 0 时取 S 的符号）。
+5. 方向相同且时间范围重叠或首尾相接（后窗起点索引 ≤ 当前区间终点索引 + 1）的显著窗口合并为趋势区间，报告区间范围、成员窗口、最小 p 值与成员斜率中位数；不显著的窗口不参与合并，但也不阻断两侧显著窗口按自身时间范围判断重叠。
+
 ## 运行测试
 
 ```bash
@@ -296,9 +376,9 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（重复值 tie 修正与连续性校正的量化对拍、非等距采样下斜率按实际时间差、方向切换分段、相接/空档合并规则、`min_slope` 过滤）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的窗口参数/点数/重复时间戳/alpha/min_slope 校验）。
 
 ## 备注
 
 - SQLite 文件随命名卷持久化；删除卷即清空数据：`docker compose down -v`。
-- 算法时间复杂度 `O(n · window_size)`，适合单次万级点数以内的离线/准实时检测。
+- 检测算法时间复杂度 `O(n · window_size)`，适合单次万级点数以内的离线/准实时检测；趋势扫描为 `O(窗口数 · window_size²)`，建议窗口控制在数百点以内。

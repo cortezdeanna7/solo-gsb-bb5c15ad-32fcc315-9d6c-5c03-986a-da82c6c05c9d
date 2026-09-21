@@ -273,3 +273,77 @@ class DetectionListResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     database: str
+
+
+class TrendRequest(BaseModel):
+    """趋势扫描请求。"""
+
+    points: list[PointIn] = Field(
+        min_length=3, description="带时间戳的数值序列（点数须不少于 window_size）"
+    )
+    window_size: int = Field(
+        default=10, ge=3, le=10_000, description="滑窗大小（点数，≥3）"
+    )
+    step_size: int = Field(default=1, ge=1, le=10_000, description="滑窗步长（点数）")
+    alpha: float = Field(
+        default=0.05, gt=0, lt=1, description="Mann-Kendall 显著性水平（双侧）"
+    )
+    min_slope: float = Field(
+        default=0.0,
+        ge=0,
+        description="趋势显著所需的最小绝对斜率（值/秒，与 slope 同单位）",
+    )
+
+    @model_validator(mode="after")
+    def _check_points(self) -> "TrendRequest":
+        if len(self.points) < self.window_size:
+            raise ValueError(
+                f"点数必须不少于 window_size（window_size={self.window_size}），"
+                f"当前只有 {len(self.points)} 个"
+            )
+        return self
+
+
+class TrendWindow(BaseModel):
+    """单个滑窗的检验结果。"""
+
+    window_index: int
+    start_index: int
+    end_index: int
+    start_time: str
+    end_time: str
+    point_count: int
+    s: int = Field(description="Mann-Kendall S 统计量")
+    var_s: float = Field(description="重复值（tie）修正后的 S 方差")
+    z_score: float = Field(description="连续性校正后的 z 分数")
+    p_value: float = Field(description="双侧 p 值（正态近似）")
+    slope: float = Field(description="Theil-Sen 斜率（值/秒，按实际时间差）")
+    significant: bool = Field(description="p_value ≤ alpha 且 |slope| ≥ min_slope")
+    direction: Literal["上升", "下降", "无显著趋势"]
+
+
+class TrendSegment(BaseModel):
+    """合并后的趋势区间。"""
+
+    direction: Literal["上升", "下降"]
+    start_index: int
+    end_index: int
+    start_time: str
+    end_time: str
+    window_indices: list[int] = Field(description="成员窗口的 window_index 列表")
+    window_count: int
+    min_p_value: float = Field(description="成员窗口中的最小 p 值")
+    median_slope: float = Field(description="成员窗口斜率的中位数（值/秒）")
+
+
+class TrendResponse(BaseModel):
+    point_count: int
+    window_size: int
+    step_size: int
+    alpha: float
+    min_slope: float
+    window_count: int
+    significant_window_count: int
+    trend_segment_count: int
+    windows: list[TrendWindow]
+    segments: list[TrendSegment]
