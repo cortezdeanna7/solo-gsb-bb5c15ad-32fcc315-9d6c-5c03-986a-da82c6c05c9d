@@ -1,4 +1,4 @@
-"""FastAPI 应用：时间序列异常检测接口。"""
+"""FastAPI 应用：时间序列异常检测 + 趋势扫描接口。"""
 
 from __future__ import annotations
 
@@ -14,8 +14,11 @@ from .models import (
     DetectResponse,
     DetectionListResponse,
     HealthResponse,
+    TrendRequest,
+    TrendResponse,
     parse_timestamp,
 )
+from .trends import scan_trends
 
 
 @asynccontextmanager
@@ -25,12 +28,13 @@ async def lifespan(app: FastAPI) -> None:
 
 
 app = FastAPI(
-    title="时间序列异常检测 API",
+    title="时间序列异常检测与趋势扫描 API",
     description=(
-        "接收带时间戳的数值序列，基于稳健滑动窗口（中位数 + MAD）识别突变，"
-        "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite。"
+        "接收带时间戳的数值序列：异常检测基于稳健滑动窗口（中位数 + MAD）识别突变，"
+        "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite；"
+        "趋势扫描以滑窗 Mann-Kendall 检验 + Theil-Sen 斜率识别显著上升 / 下降趋势区间。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -125,6 +129,26 @@ def list_detections(
     """列出历史检测（摘要信息），可按 series_id 过滤。"""
     items, total = database.list_detections(series_id=series_id, limit=limit, offset=offset)
     return {"items": items, "total": total}
+
+
+@app.post("/api/v1/trends", response_model=TrendResponse, tags=["趋势"])
+def create_trend_scan(req: TrendRequest) -> dict:
+    """趋势扫描：滑窗 Mann-Kendall + Theil-Sen，合并显著趋势区间（无状态，不入库）。"""
+    timestamps, values = _prepare_series(req.points)
+
+    result = scan_trends(
+        timestamps=timestamps,
+        values=values,
+        window_size=req.window_size,
+        step_size=req.step_size,
+        alpha=req.alpha,
+        min_slope=req.min_slope,
+    )
+
+    body = {"series_id": req.series_id, **result}
+    if not req.include_windows:
+        body = {k: v for k, v in body.items() if k != "windows"}
+    return body
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])

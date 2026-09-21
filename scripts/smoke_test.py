@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.detection import analyze_series  # noqa: E402
 from app.main import app  # noqa: E402
+from app.trends import _mann_kendall, scan_trends  # noqa: E402
 
 
 def test_algorithm_spikes_and_shift() -> None:
@@ -277,6 +278,124 @@ def test_gap_aware_defaults_compatible() -> None:
     print("✓ 断档感知默认关闭：新增字段全部取兼容默认值")
 
 
+def test_mann_kendall_ties_quantitative() -> None:
+    """重复值方差修正 + 连续性校正的量化校验；全同值窗口退化为无趋势。"""
+    # 含并列组 [1,1,2,2,3]：S=8，tie_term=2·1·9×2=36，Var=(300−36)/18=14.6667
+    s, var_s, z, p = _mann_kendall([1.0, 1.0, 2.0, 2.0, 3.0])
+    assert s == 8
+    assert abs(var_s - 264.0 / 18.0) < 1e-9
+    assert abs(z - 7.0 / var_s**0.5) < 1e-9  # 连续性校正：(S−1)/√Var
+    assert abs(z - 1.8278) < 1e-3
+    assert abs(p - 0.0676) < 5e-4
+
+    # 无重复值对照 [1,2,3,4,5]：S=10，Var=300/18=16.6667，修正后方差更小
+    s2, var_s2, z2, p2 = _mann_kendall([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert s2 == 10
+    assert abs(var_s2 - 300.0 / 18.0) < 1e-9
+    assert var_s < var_s2  # 重复值修正使方差减小
+    assert abs(p2 - 0.0275) < 5e-4
+
+    # 全部相同：Var(S)=0，Z=0，p=1，无趋势
+    s3, var_s3, z3, p3 = _mann_kendall([7.0] * 6)
+    assert s3 == 0 and var_s3 == 0.0 and z3 == 0.0 and p3 == 1.0
+
+    # 全同值窗口经完整扫描判为平稳、不产生区间
+    ts = [f"2026-09-20T07:{i:02d}:00Z" for i in range(6)]
+    result = scan_trends(ts, [7.0] * 6, window_size=6, step_size=1)
+    assert result["windows"][0]["direction"] == "平稳"
+    assert result["windows"][0]["significant"] is False
+    assert result["trend_segment_count"] == 0
+    print("✓ Mann-Kendall 重复值方差修正与连续性校正量化正确，全同值窗口判平稳")
+
+
+def test_theil_sen_irregular_sampling() -> None:
+    """非等距采样：Theil-Sen 按实际时间差还原真实斜率（值/秒）。"""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 20, 6, 0, 0, tzinfo=timezone.utc)
+    offsets = [0, 7, 13, 42, 55, 90, 121, 200, 260, 301]  # 非等距秒偏移
+    ts = [(base + timedelta(seconds=o)).isoformat() for o in offsets]
+    values = [3.0 + 0.02 * o for o in offsets]  # 真实斜率 0.02 /秒
+
+    result = scan_trends(ts, values, window_size=10, step_size=1, min_slope=0.001)
+    assert result["window_count"] == 1
+    w = result["windows"][0]
+    assert abs(w["slope"] - 0.02) < 1e-12  # 按实际时间差，非按点序号
+    assert w["significant"] is True and w["direction"] == "上升"
+    assert result["segments"][0]["median_slope"] == w["slope"]
+
+    # 同样的值若按等距点序号理解斜率会失真：换一组非等距时间戳斜率随之改变
+    offsets2 = [0, 100, 101, 300, 301, 500, 600, 800, 900, 1000]
+    ts2 = [(base + timedelta(seconds=o)).isoformat() for o in offsets2]
+    values2 = [1.0 + 0.005 * o for o in offsets2]
+    result2 = scan_trends(ts2, values2, window_size=10, step_size=1, min_slope=0.0001)
+    assert abs(result2["windows"][0]["slope"] - 0.005) < 1e-12
+    print("✓ 非等距采样：Theil-Sen 按实际时间差还原斜率（值/秒）")
+
+
+def test_trend_direction_switch() -> None:
+    """方向切换：先升后降的序列拆分为方向相反的两个趋势区间。"""
+    n = 40
+    values = [float(i) if i < 20 else float(38 - i) for i in range(n)]
+    ts = [f"2026-09-20T05:{i // 60:02d}:{i % 60:02d}Z" for i in range(n)]  # 1 秒间隔
+
+    result = scan_trends(ts, values, window_size=10, step_size=5, alpha=0.05, min_slope=0.5)
+    assert result["window_count"] == 7
+    assert result["trend_segment_count"] == 2
+
+    up, down = result["segments"]
+    assert up["direction"] == "上升" and (up["start_index"], up["end_index"]) == (0, 19)
+    assert down["direction"] == "下降" and (down["start_index"], down["end_index"]) == (20, 39)
+    assert up["window_count"] == 3 and down["window_count"] == 3
+    assert abs(up["median_slope"] - 1.0) < 1e-9  # 1 秒间隔下斜率 ±1 /秒
+    assert abs(down["median_slope"] + 1.0) < 1e-9
+    assert up["min_p_value"] < 1e-3 and down["min_p_value"] < 1e-3
+    # 区间成员窗口方向一致，且跨峰窗口 [15..24] 不显著、不属于任何区间
+    assert all(w["direction"] == "上升" for w in up["windows"])
+    assert all(w["direction"] == "下降" for w in down["windows"])
+    middle = result["windows"][3]
+    assert (middle["start_index"], middle["end_index"]) == (15, 24)
+    assert middle["significant"] is False and middle["direction"] == "平稳"
+    print("✓ 方向切换：上升/下降显著窗口各自合并，跨峰窗口判平稳")
+
+
+def test_trend_merge_adjacent_and_gap() -> None:
+    """合并规则：重叠或首尾相接的同向显著窗口合并；留空档的不合并。"""
+    values = [float(i) for i in range(25)]
+    ts = [f"2026-09-20T04:{i // 60:02d}:{i % 60:02d}Z" for i in range(25)]
+
+    # step == window_size：窗口首尾相接，同向显著窗口合并为一段
+    joined = scan_trends(ts, values[:20], window_size=10, step_size=10, min_slope=0.1)
+    assert joined["window_count"] == 2
+    assert joined["trend_segment_count"] == 1
+    seg = joined["segments"][0]
+    assert (seg["start_index"], seg["end_index"]) == (0, 19)
+    assert seg["window_count"] == 2 and seg["point_count"] == 20
+
+    # step > window_size：窗口间留空档，即使同向显著也不合并
+    gapped = scan_trends(ts, values, window_size=10, step_size=15, min_slope=0.1)
+    assert gapped["window_count"] == 2
+    assert gapped["trend_segment_count"] == 2
+    assert [(s["start_index"], s["end_index"]) for s in gapped["segments"]] == [(0, 9), (15, 24)]
+    print("✓ 合并规则：重叠/首尾相接合并，空档不合并")
+
+
+def test_trend_min_slope_filter() -> None:
+    """min_slope 过滤：p 值达标但绝对斜率不足时不判趋势。"""
+    values = [0.001 * i for i in range(20)]  # 斜率 0.001 /秒（1 秒间隔）
+    ts = [f"2026-09-20T03:{i // 60:02d}:{i % 60:02d}Z" for i in range(20)]
+
+    blocked = scan_trends(ts, values, window_size=10, step_size=5, min_slope=0.01)
+    assert blocked["significant_window_count"] == 0
+    assert blocked["trend_segment_count"] == 0
+    assert all(w["p_value"] <= 0.05 for w in blocked["windows"])  # p 值其实达标
+
+    allowed = scan_trends(ts, values, window_size=10, step_size=5, min_slope=0.0001)
+    assert allowed["significant_window_count"] == allowed["window_count"]
+    assert allowed["trend_segment_count"] == 1
+    print("✓ min_slope 过滤：斜率不达标的显著 p 值窗口不判趋势")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -438,7 +557,73 @@ def _exercise_api(client: "TestClient") -> None:
     r = client.post("/api/v1/detections", json=bad)
     assert r.status_code == 422
 
-    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略")
+    # 趋势扫描：先升后降序列，返回方向相反的两个区间
+    trend_points = []
+    for i in range(40):
+        v = 10 + 0.25 * i if i < 20 else 10 + 0.25 * (38 - i)
+        trend_points.append(
+            {"timestamp": f"2026-09-20T22:{i // 60:02d}:{i % 60:02d}Z", "value": v}
+        )
+    trend_payload = {
+        "series_id": "test-series-trend",
+        "window_size": 10,
+        "step_size": 5,
+        "alpha": 0.05,
+        "min_slope": 0.1,
+        "points": trend_points,
+    }
+    r = client.post("/api/v1/trends", json=trend_payload)
+    assert r.status_code == 200, r.text
+    tb = r.json()
+    assert tb["series_id"] == "test-series-trend"
+    assert tb["window_count"] == 7
+    assert tb["significant_window_count"] == 6
+    assert tb["trend_segment_count"] == 2
+    assert [s["direction"] for s in tb["segments"]] == ["上升", "下降"]
+    up_seg, down_seg = tb["segments"]
+    assert (up_seg["start_index"], up_seg["end_index"]) == (0, 19)
+    assert (down_seg["start_index"], down_seg["end_index"]) == (20, 39)
+    assert up_seg["window_count"] == 3 and up_seg["min_p_value"] < 1e-3
+    assert abs(up_seg["median_slope"] - 0.25) < 1e-9  # 1 秒间隔，0.25/秒
+    assert abs(down_seg["median_slope"] + 0.25) < 1e-9
+    assert len(up_seg["windows"]) == 3  # 成员窗口随区间返回
+    assert {"s", "var_s", "z", "p_value", "slope", "significant"} <= set(up_seg["windows"][0])
+    assert tb["windows"] is None  # 默认不返回全部窗口
+
+    # include_windows=true 返回全部评估窗口（含不显著窗口）
+    r = client.post("/api/v1/trends", json={**trend_payload, "include_windows": True})
+    assert r.status_code == 200, r.text
+    tw = r.json()["windows"]
+    assert len(tw) == 7
+    assert tw[3]["significant"] is False and tw[3]["direction"] == "平稳"
+
+    # 参数校验：点数少于 window_size
+    bad = dict(trend_payload)
+    bad["points"] = trend_points[:5]
+    r = client.post("/api/v1/trends", json=bad)
+    assert r.status_code == 422
+
+    # 参数校验：window_size < 3 / step_size < 1 / alpha 越界 / min_slope 为负
+    for field, value in [
+        ("window_size", 2),
+        ("step_size", 0),
+        ("alpha", 0),
+        ("alpha", 1),
+        ("min_slope", -0.1),
+    ]:
+        bad = dict(trend_payload)
+        bad[field] = value
+        r = client.post("/api/v1/trends", json=bad)
+        assert r.status_code == 422, (field, value, r.text)
+
+    # 参数校验：重复时间戳
+    bad = dict(trend_payload)
+    bad["points"] = trend_points[:10] + [trend_points[9]]
+    r = client.post("/api/v1/trends", json=bad)
+    assert r.status_code == 422
+    assert "重复时间戳" in r.text
+
+    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / 趋势扫描")
 
 
 if __name__ == "__main__":
@@ -452,5 +637,10 @@ if __name__ == "__main__":
     test_gap_aware_baseline_restart_and_no_merge_across_gap()
     test_gap_aware_guarded_resets_state()
     test_gap_aware_defaults_compatible()
+    test_mann_kendall_ties_quantitative()
+    test_theil_sen_irregular_sampling()
+    test_trend_direction_switch()
+    test_trend_merge_adjacent_and_gap()
+    test_trend_min_slope_filter()
     test_api_end_to_end()
     print("\n全部冒烟测试通过 ✅")

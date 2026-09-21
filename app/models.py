@@ -128,6 +128,102 @@ class DetectRequest(BaseModel):
         return self
 
 
+class TrendRequest(BaseModel):
+    """趋势扫描请求。"""
+
+    series_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="可选的业务序列标识，随响应回显",
+    )
+    points: list[PointIn] = Field(min_length=2, description="带时间戳的数值序列")
+    window_size: int = Field(
+        default=10, ge=3, le=10_000, description="滑动窗口大小（点数，≥3）"
+    )
+    step_size: int = Field(
+        default=5,
+        ge=1,
+        le=10_000,
+        description=(
+            "滑动步长（点数）：小于 window_size 时窗口重叠，等于时首尾相接，"
+            "大于时窗口间留有空档（空档两侧的显著窗口不会合并）"
+        ),
+    )
+    alpha: float = Field(
+        default=0.05,
+        gt=0,
+        lt=1,
+        description="Mann-Kendall 显著性水平，p_value ≤ alpha 才可能判为趋势",
+    )
+    min_slope: float = Field(
+        default=0.0,
+        ge=0,
+        description="最小绝对斜率（值/秒），|slope| 达到该值才判为趋势；默认 0 不过滤",
+    )
+    include_windows: bool = Field(
+        default=False,
+        description="响应是否包含全部评估窗口（趋势区间的成员窗口始终返回）",
+    )
+
+    @model_validator(mode="after")
+    def _check_points(self) -> "TrendRequest":
+        if len(self.points) < self.window_size:
+            raise ValueError(
+                f"点数必须不少于 window_size（window_size={self.window_size}），"
+                f"当前只有 {len(self.points)} 个"
+            )
+        return self
+
+
+class TrendWindow(BaseModel):
+    """单个滑动窗口的趋势检验结果。"""
+
+    window_index: int = Field(description="窗口序号（按滑动顺序从 0 开始）")
+    start_index: int
+    end_index: int
+    start_time: str
+    end_time: str
+    point_count: int
+    s: int = Field(description="Mann-Kendall S 统计量")
+    var_s: float = Field(description="S 的方差（含重复值修正）")
+    z: float = Field(description="连续性校正后的 Z 值")
+    p_value: float = Field(description="双侧 p 值（正态近似）")
+    slope: float = Field(description="Theil-Sen 斜率（值/秒，按实际时间差）")
+    significant: bool = Field(description="是否显著趋势（p≤alpha 且 |slope|≥min_slope）")
+    direction: Literal["上升", "下降", "平稳"]
+
+
+class TrendSegment(BaseModel):
+    """合并后的趋势区间。"""
+
+    direction: Literal["上升", "下降"]
+    start_index: int
+    end_index: int
+    start_time: str
+    end_time: str
+    point_count: int = Field(description="区间覆盖的原始点数")
+    window_count: int = Field(description="成员窗口数")
+    min_p_value: float = Field(description="成员窗口中的最小 p 值")
+    median_slope: float = Field(description="成员窗口斜率的中位数（值/秒）")
+    windows: list[TrendWindow] = Field(description="成员窗口明细")
+
+
+class TrendResponse(BaseModel):
+    series_id: str | None = None
+    point_count: int
+    window_size: int
+    step_size: int
+    alpha: float
+    min_slope: float
+    window_count: int = Field(description="评估窗口总数")
+    significant_window_count: int = Field(description="显著趋势窗口数")
+    trend_segment_count: int = Field(description="合并后的趋势区间数")
+    segments: list[TrendSegment]
+    windows: list[TrendWindow] | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class Baseline(BaseModel):
     median: float
     mad: float
